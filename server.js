@@ -71,3 +71,4 @@ app.listen(PORT, () => {
 setInterval(() => {
   console.log("⏳ server alive");
 }, 10000);
+// deploy test za 10 jan 2026 12:38:37 CET
