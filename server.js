@@ -9,37 +9,38 @@ const PORT = process.env.PORT || 10000;
 
 // ===== CONFIG =====
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
-
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || "*")
   .split(",")
-  .map(s => s.trim())
+  .map((s) => s.trim())
   .filter(Boolean);
 
-// Render Disk tip: zet DB_PATH op /var/data/kc.sqlite in Render Environment
+// Render Disk tip: zet DB_PATH in Render Environment naar /var/data/kc.sqlite
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, "kc.sqlite");
 const ADMIN_HTML_PATH = path.join(__dirname, "admin.html");
 
 // ===== MIDDLEWARE =====
 app.use(express.json({ limit: "1mb" }));
 
-app.use(cors({
-  origin(origin, cb) {
-    if (!origin) return cb(null, true);
-    if (CORS_ORIGINS.includes("*")) return cb(null, true);
-    if (CORS_ORIGINS.includes(origin)) return cb(null, true);
+app.use(
+  cors({
+    origin(origin, cb) {
+      if (!origin) return cb(null, true);
+      if (CORS_ORIGINS.includes("*")) return cb(null, true);
+      if (CORS_ORIGINS.includes(origin)) return cb(null, true);
 
-    const ok = CORS_ORIGINS.some(o => {
-      if (!o.includes("*")) return false;
-      const re = new RegExp("^" + o.replace(/\./g, "\\.").replace(/\*/g, ".*") + "$");
-      return re.test(origin);
-    });
+      const ok = CORS_ORIGINS.some((o) => {
+        if (!o.includes("*")) return false;
+        const re = new RegExp("^" + o.replace(/\./g, "\\.").replace(/\*/g, ".*") + "$");
+        return re.test(origin);
+      });
 
-    return ok ? cb(null, true) : cb(new Error("CORS blocked"));
-  }
-}));
+      return ok ? cb(null, true) : cb(new Error("CORS blocked"));
+    },
+  })
+);
 
-// Static files (admin.html e.d.)
-app.use(express.static(__dirname));
+// Static files (admin.html, evt. css/js als je die later toevoegt)
+app.use(express.static(__dirname, { etag: false, lastModified: false }));
 
 // ===== STARTUP LOGS =====
 console.log("==== STARTUP ====");
@@ -60,7 +61,8 @@ const db = new sqlite3.Database(DB_PATH, (err) => {
   console.log("✅ SQLite connected:", DB_PATH);
 });
 
-db.run(`
+db.run(
+  `
   CREATE TABLE IF NOT EXISTS leads (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     createdAt TEXT NOT NULL,
@@ -71,10 +73,12 @@ db.run(`
     message TEXT NOT NULL,
     source TEXT NOT NULL
   )
-`, (err) => {
-  if (err) console.error("❌ Table create error:", err.message);
-  else console.log("✅ Table ready: leads");
-});
+`,
+  (err) => {
+    if (err) console.error("❌ Table create error:", err.message);
+    else console.log("✅ Table ready: leads");
+  }
+);
 
 // ===== AUTH =====
 function requireAdmin(req, res, next) {
@@ -94,7 +98,7 @@ app.get("/health", (_, res) => {
   res.json({
     ok: true,
     time: new Date().toISOString(),
-    commit: process.env.RENDER_GIT_COMMIT || null
+    commit: process.env.RENDER_GIT_COMMIT || null,
   });
 });
 
@@ -106,37 +110,53 @@ app.get("/debug", (_, res) => {
     adminHtmlPath: ADMIN_HTML_PATH,
     adminHtmlExists: fs.existsSync(ADMIN_HTML_PATH),
     dbPath: DB_PATH,
-    dbExists: fs.existsSync(DB_PATH)
+    dbExists: fs.existsSync(DB_PATH),
   });
 });
 
-// Admin pagina (werkt door express.static + dit)
-app.get("/admin", (_, res) => {
+// Admin page (NO CACHE + duidelijke foutmelding als sendFile faalt)
+app.get("/admin", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+
   if (!fs.existsSync(ADMIN_HTML_PATH)) {
     return res.status(500).send("admin.html missing on server (check /debug)");
   }
-  res.sendFile(ADMIN_HTML_PATH);
+
+  res.sendFile(ADMIN_HTML_PATH, (err) => {
+    if (err) {
+      console.error("❌ sendFile(/admin) error:", err);
+      res.status(500).send("Failed to serve admin.html");
+    }
+  });
 });
 
-// Lead create (public)
+app.get("/admin/", (_, res) => res.redirect("/admin"));
+
+// CREATE LEAD (public)
 app.post("/api/leads", (req, res) => {
   const { name, email, phone, service, message, source } = req.body || {};
+
   if (!name || !email || !service || !message) {
     return res.status(400).json({ ok: false, error: "Missing fields" });
   }
 
   db.run(
-    `INSERT INTO leads (createdAt, name, email, phone, service, message, source)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `
+      INSERT INTO leads (createdAt, name, email, phone, service, message, source)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `,
     [new Date().toISOString(), name, email, phone || "", service, message, source || "unknown"],
     function (err) {
-      if (err) return res.status(500).json({ ok: false, error: "Insert failed" });
+      if (err) {
+        console.error("❌ Insert error:", err.message);
+        return res.status(500).json({ ok: false, error: "Insert failed" });
+      }
       res.json({ ok: true, id: this.lastID });
     }
   );
 });
 
-// Admin API
+// ADMIN API
 app.get("/api/admin/leads", requireAdmin, (req, res) => {
   db.all(`SELECT * FROM leads ORDER BY datetime(createdAt) DESC`, [], (err, rows) => {
     if (err) return res.status(500).json({ ok: false, error: "DB read failed" });
@@ -151,7 +171,7 @@ app.delete("/api/admin/leads/:id", requireAdmin, (req, res) => {
   });
 });
 
-// 404 als laatste
+// 404 last
 app.use((req, res) => res.status(404).send(`Cannot ${req.method} ${req.path}`));
 
 app.listen(PORT, () => console.log(`🚀 Server live on port ${PORT}`));
