@@ -11,7 +11,10 @@ const PORT = process.env.PORT || 10000;
 // ===== CONFIG =====
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || process.env.ADMIN_API_KEY || "";
 
-const CORS_ORIGINS = (process.env.CORS_ORIGINS || "*")
+// Zet in Render ENV: CORS_ORIGINS=https://kcdetailingstudio.nl,https://www.kcdetailingstudio.nl
+// Voor debug mag "*"
+const CORS_ORIGINS_RAW = process.env.CORS_ORIGINS || "*";
+const CORS_ORIGINS = CORS_ORIGINS_RAW
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
@@ -22,12 +25,23 @@ const ADMIN_HTML_PATH = path.join(__dirname, "admin.html");
 // ===== MIDDLEWARE =====
 app.use(express.json({ limit: "1mb" }));
 
+/**
+ * ✅ CORS FIX (Wix iframe / Safari friendly)
+ * - Zorgt dat OPTIONS preflight altijd OK is
+ * - Zorgt dat headers altijd terugkomen
+ */
 const corsOptions = {
   origin(origin, cb) {
+    // server-to-server / curl zonder Origin
     if (!origin) return cb(null, true);
+
+    // allow all
     if (CORS_ORIGINS.includes("*")) return cb(null, true);
+
+    // exact match
     if (CORS_ORIGINS.includes(origin)) return cb(null, true);
 
+    // wildcard support
     const ok = CORS_ORIGINS.some((o) => {
       if (!o.includes("*")) return false;
       const re = new RegExp("^" + o.replace(/\./g, "\\.").replace(/\*/g, ".*") + "$");
@@ -36,9 +50,15 @@ const corsOptions = {
 
     return ok ? cb(null, true) : cb(new Error(`CORS blocked: ${origin}`));
   },
+  methods: ["GET", "POST", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: false,
+  maxAge: 86400,
 };
 
 app.use(cors(corsOptions));
+
+// ✅ Preflight altijd beantwoorden (heel belangrijk bij Wix)
 app.options("*", cors(corsOptions));
 
 // Static files (admin.html)
@@ -55,6 +75,7 @@ console.log("admin.html exists =", fs.existsSync(ADMIN_HTML_PATH));
 console.log("CORS_ORIGINS =", CORS_ORIGINS.join(", "));
 console.log("ADMIN_TOKEN set =", Boolean(ADMIN_TOKEN));
 console.log("MAIL_TO =", process.env.MAIL_TO ? "set" : "missing");
+console.log("SMTP_HOST =", process.env.SMTP_HOST ? "set" : "missing");
 console.log("SMTP_USER =", process.env.SMTP_USER ? "set" : "missing");
 console.log("MAIL_FROM =", process.env.MAIL_FROM ? "set" : "missing");
 console.log("BRAND_NAME =", process.env.BRAND_NAME || "(default KC Detailing Studio)");
@@ -113,6 +134,7 @@ function getMailer() {
 
   if (!host || !port || !user || !pass) return null;
 
+  // App password kan met spaties geplakt worden — haal weg
   pass = String(pass).replace(/\s+/g, "");
 
   return nodemailer.createTransport({
@@ -135,60 +157,6 @@ function escapeHtml(s) {
 
 function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(email || "").trim());
-}
-
-async function sendOwnerEmail({ transporter, from, to, id, name, email, phone, service, message }) {
-  const subject = `KC Detailing – Offerte aanvraag: ${service}`;
-  const text =
-`Nieuwe offerte aanvraag (id: ${id})
-
-Naam: ${name}
-E-mail: ${email}
-Telefoon: ${phone || "-"}
-
-Service: ${service}
-
-Bericht:
-${message}
-`;
-
-  await transporter.sendMail({ from, to, subject, text, replyTo: email });
-}
-
-async function sendCustomerConfirmation({ transporter, from, to, brand, id, name, phone, service, message }) {
-  const subject = `Bevestiging offerteaanvraag – ${brand}`;
-
-  const html = `
-  <div style="font-family:Arial,sans-serif;line-height:1.55;color:#111">
-    <h2 style="margin:0 0 12px">We hebben je aanvraag ontvangen</h2>
-    <p style="margin:0 0 10px">
-      Bedankt${name ? ` ${escapeHtml(name)}` : ""}. We hebben je offerteaanvraag ontvangen en nemen zo snel mogelijk contact met je op.
-    </p>
-
-    <div style="border:1px solid #eee;border-radius:10px;padding:14px;margin:14px 0">
-      <h3 style="margin:0 0 10px;font-size:16px">Samenvatting</h3>
-      <table style="border-collapse:collapse;width:100%;font-size:14px">
-        <tr><td style="padding:6px 0;width:160px"><b>Referentie</b></td><td style="padding:6px 0">#${id}</td></tr>
-        <tr><td style="padding:6px 0"><b>Dienst</b></td><td style="padding:6px 0">${escapeHtml(service)}</td></tr>
-        ${phone ? `<tr><td style="padding:6px 0"><b>Telefoon</b></td><td style="padding:6px 0">${escapeHtml(phone)}</td></tr>` : ""}
-      </table>
-
-      ${message ? `<p style="margin:10px 0 0"><b>Opmerking:</b><br/>${escapeHtml(message).replaceAll("\n","<br/>")}</p>` : ""}
-    </div>
-
-    <p style="margin:0">
-      Met vriendelijke groet,<br/>
-      <b>${escapeHtml(brand)}</b>
-    </p>
-  </div>
-  `;
-
-  await transporter.sendMail({
-    from,
-    to,
-    subject,
-    html,
-  });
 }
 
 // ===== AUTH =====
@@ -266,7 +234,7 @@ app.post("/api/leads", async (req, res) => {
   }
 });
 
-// Offerte via mail: opslaan + mailen + bevestiging naar klant
+// Offerte via mail: opslaan + mailen + bevestiging klant
 async function handleEmailLead(req, res) {
   try {
     const { name, email, phone, service, message } = req.body || {};
@@ -289,30 +257,52 @@ async function handleEmailLead(req, res) {
     const from = process.env.MAIL_FROM || process.env.SMTP_USER;
     const brand = process.env.BRAND_NAME || "KC Detailing Studio";
 
-    // 1) mail naar jou (owner)
-    await sendOwnerEmail({
-      transporter,
-      from,
-      to: ownerTo,
-      id,
-      name,
-      email,
-      phone,
-      service,
-      message,
-    });
+    // 1) Mail naar jou
+    const ownerSubject = `KC Detailing – Offerte aanvraag: ${service}`;
+    const ownerText =
+`Nieuwe offerte aanvraag (id: ${id})
 
-    // 2) bevestigingsmail naar klant
-    await sendCustomerConfirmation({
-      transporter,
+Naam: ${name}
+E-mail: ${email}
+Telefoon: ${phone || "-"}
+
+Service: ${service}
+
+Bericht:
+${message}
+`;
+    await transporter.sendMail({ from, to: ownerTo, subject: ownerSubject, text: ownerText, replyTo: email });
+
+    // 2) Bevestiging naar klant
+    const confirmSubject = `Bevestiging offerteaanvraag – ${brand}`;
+    const confirmHtml = `
+      <div style="font-family:Arial,sans-serif;line-height:1.55;color:#111">
+        <h2 style="margin:0 0 12px">We hebben je aanvraag ontvangen</h2>
+        <p style="margin:0 0 10px">Bedankt ${escapeHtml(name)}. We nemen zo snel mogelijk contact met je op.</p>
+
+        <div style="border:1px solid #eee;border-radius:10px;padding:14px;margin:14px 0">
+          <h3 style="margin:0 0 10px;font-size:16px">Samenvatting</h3>
+          <table style="border-collapse:collapse;width:100%;font-size:14px">
+            <tr><td style="padding:6px 0;width:160px"><b>Referentie</b></td><td style="padding:6px 0">#${id}</td></tr>
+            <tr><td style="padding:6px 0"><b>Dienst</b></td><td style="padding:6px 0">${escapeHtml(service)}</td></tr>
+            ${phone ? `<tr><td style="padding:6px 0"><b>Telefoon</b></td><td style="padding:6px 0">${escapeHtml(phone)}</td></tr>` : ""}
+          </table>
+          <p style="margin:10px 0 0"><b>Bericht:</b><br/>${escapeHtml(message).replaceAll("\n","<br/>")}</p>
+        </div>
+
+        <p style="margin:0">
+          Met vriendelijke groet,<br/>
+          <b>${escapeHtml(brand)}</b>
+        </p>
+      </div>
+    `;
+
+    await transporter.sendMail({
       from,
       to: email,
-      brand,
-      id,
-      name,
-      phone,
-      service,
-      message,
+      subject: confirmSubject,
+      html: confirmHtml,
+      replyTo: process.env.REPLY_TO || from,
     });
 
     return res.json({ ok: true, id, mailed: true, confirmationMailed: true });
@@ -324,7 +314,7 @@ async function handleEmailLead(req, res) {
 
 app.post("/api/leads/email", handleEmailLead);
 
-// ✅ compat route voor jouw curl: /api/email
+// ✅ compat route
 app.post("/api/email", handleEmailLead);
 
 // Admin API
@@ -343,6 +333,6 @@ app.delete("/api/admin/leads/:id", requireAdmin, (req, res) => {
 });
 
 // 404 last
-app.use((req, res) => res.status(404).send(`Cannot ${req.method} ${req.path}`));
+app.use((req, res) => res.status(404).json({ ok: false, error: `Cannot ${req.method} ${req.path}` }));
 
 app.listen(PORT, () => console.log(`🚀 Server live on port ${PORT}`));
