@@ -24,16 +24,10 @@ app.use(express.json({ limit: "1mb" }));
 
 const corsOptions = {
   origin(origin, cb) {
-    // server-to-server / curl zonder Origin
     if (!origin) return cb(null, true);
-
-    // allow all
     if (CORS_ORIGINS.includes("*")) return cb(null, true);
-
-    // exact match
     if (CORS_ORIGINS.includes(origin)) return cb(null, true);
 
-    // wildcard support (optioneel)
     const ok = CORS_ORIGINS.some((o) => {
       if (!o.includes("*")) return false;
       const re = new RegExp("^" + o.replace(/\./g, "\\.").replace(/\*/g, ".*") + "$");
@@ -62,6 +56,8 @@ console.log("CORS_ORIGINS =", CORS_ORIGINS.join(", "));
 console.log("ADMIN_TOKEN set =", Boolean(ADMIN_TOKEN));
 console.log("MAIL_TO =", process.env.MAIL_TO ? "set" : "missing");
 console.log("SMTP_USER =", process.env.SMTP_USER ? "set" : "missing");
+console.log("MAIL_FROM =", process.env.MAIL_FROM ? "set" : "missing");
+console.log("BRAND_NAME =", process.env.BRAND_NAME || "(default KC Detailing Studio)");
 console.log("=================");
 
 // ===== DATABASE =====
@@ -117,7 +113,6 @@ function getMailer() {
 
   if (!host || !port || !user || !pass) return null;
 
-  // App password kan met spaties geplakt worden — haal weg
   pass = String(pass).replace(/\s+/g, "");
 
   return nodemailer.createTransport({
@@ -126,6 +121,73 @@ function getMailer() {
     secure: port === 465,      // 465 = SSL
     requireTLS: port === 587,  // 587 = STARTTLS
     auth: { user, pass },
+  });
+}
+
+function escapeHtml(s) {
+  return String(s || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(email || "").trim());
+}
+
+async function sendOwnerEmail({ transporter, from, to, id, name, email, phone, service, message }) {
+  const subject = `KC Detailing – Offerte aanvraag: ${service}`;
+  const text =
+`Nieuwe offerte aanvraag (id: ${id})
+
+Naam: ${name}
+E-mail: ${email}
+Telefoon: ${phone || "-"}
+
+Service: ${service}
+
+Bericht:
+${message}
+`;
+
+  await transporter.sendMail({ from, to, subject, text, replyTo: email });
+}
+
+async function sendCustomerConfirmation({ transporter, from, to, brand, id, name, phone, service, message }) {
+  const subject = `Bevestiging offerteaanvraag – ${brand}`;
+
+  const html = `
+  <div style="font-family:Arial,sans-serif;line-height:1.55;color:#111">
+    <h2 style="margin:0 0 12px">We hebben je aanvraag ontvangen</h2>
+    <p style="margin:0 0 10px">
+      Bedankt${name ? ` ${escapeHtml(name)}` : ""}. We hebben je offerteaanvraag ontvangen en nemen zo snel mogelijk contact met je op.
+    </p>
+
+    <div style="border:1px solid #eee;border-radius:10px;padding:14px;margin:14px 0">
+      <h3 style="margin:0 0 10px;font-size:16px">Samenvatting</h3>
+      <table style="border-collapse:collapse;width:100%;font-size:14px">
+        <tr><td style="padding:6px 0;width:160px"><b>Referentie</b></td><td style="padding:6px 0">#${id}</td></tr>
+        <tr><td style="padding:6px 0"><b>Dienst</b></td><td style="padding:6px 0">${escapeHtml(service)}</td></tr>
+        ${phone ? `<tr><td style="padding:6px 0"><b>Telefoon</b></td><td style="padding:6px 0">${escapeHtml(phone)}</td></tr>` : ""}
+      </table>
+
+      ${message ? `<p style="margin:10px 0 0"><b>Opmerking:</b><br/>${escapeHtml(message).replaceAll("\n","<br/>")}</p>` : ""}
+    </div>
+
+    <p style="margin:0">
+      Met vriendelijke groet,<br/>
+      <b>${escapeHtml(brand)}</b>
+    </p>
+  </div>
+  `;
+
+  await transporter.sendMail({
+    from,
+    to,
+    subject,
+    html,
   });
 }
 
@@ -162,6 +224,7 @@ app.get("/debug", (_, res) => {
     smtpConfigured: Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS),
     mailToSet: Boolean(process.env.MAIL_TO),
     mailFrom: process.env.MAIL_FROM || null,
+    brandName: process.env.BRAND_NAME || "KC Detailing Studio",
   });
 });
 
@@ -183,13 +246,16 @@ app.get("/admin", (req, res) => {
 
 app.get("/admin/", (_, res) => res.redirect("/admin"));
 
-// Create lead (public)
+// Create lead (public) - alleen opslaan
 app.post("/api/leads", async (req, res) => {
   try {
     const { name, email, phone, service, message, source } = req.body || {};
 
     if (!name || !email || !service || !message) {
       return res.status(400).json({ ok: false, error: "Missing fields" });
+    }
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ ok: false, error: "Invalid email" });
     }
 
     const id = await insertLead({ name, email, phone, service, message, source });
@@ -200,7 +266,7 @@ app.post("/api/leads", async (req, res) => {
   }
 });
 
-// Offerte via mail: opslaan + mailen
+// Offerte via mail: opslaan + mailen + bevestiging naar klant
 async function handleEmailLead(req, res) {
   try {
     const { name, email, phone, service, message } = req.body || {};
@@ -208,34 +274,48 @@ async function handleEmailLead(req, res) {
     if (!name || !email || !service || !message) {
       return res.status(400).json({ ok: false, error: "Missing fields" });
     }
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ ok: false, error: "Invalid email" });
+    }
 
     const id = await insertLead({ name, email, phone, service, message, source: "email" });
 
-    const to = process.env.MAIL_TO;
-    if (!to) return res.status(500).json({ ok: false, error: "MAIL_TO missing" });
+    const ownerTo = process.env.MAIL_TO;
+    if (!ownerTo) return res.status(500).json({ ok: false, error: "MAIL_TO missing" });
 
     const transporter = getMailer();
     if (!transporter) return res.status(500).json({ ok: false, error: "SMTP config missing" });
 
     const from = process.env.MAIL_FROM || process.env.SMTP_USER;
+    const brand = process.env.BRAND_NAME || "KC Detailing Studio";
 
-    const subject = `KC Detailing – Offerte aanvraag: ${service}`;
-    const text =
-`Nieuwe offerte aanvraag (id: ${id})
+    // 1) mail naar jou (owner)
+    await sendOwnerEmail({
+      transporter,
+      from,
+      to: ownerTo,
+      id,
+      name,
+      email,
+      phone,
+      service,
+      message,
+    });
 
-Naam: ${name}
-E-mail: ${email}
-Telefoon: ${phone || "-"}
+    // 2) bevestigingsmail naar klant
+    await sendCustomerConfirmation({
+      transporter,
+      from,
+      to: email,
+      brand,
+      id,
+      name,
+      phone,
+      service,
+      message,
+    });
 
-Service: ${service}
-
-Bericht:
-${message}
-`;
-
-    await transporter.sendMail({ from, to, subject, text });
-
-    return res.json({ ok: true, id, mailed: true });
+    return res.json({ ok: true, id, mailed: true, confirmationMailed: true });
   } catch (err) {
     console.error("❌ Email send error:", err?.message || err);
     return res.status(500).json({ ok: false, error: "Email send failed" });
