@@ -11,7 +11,8 @@ const PORT = process.env.PORT || 10000;
 // ===== CONFIG =====
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || process.env.ADMIN_API_KEY || "";
 
-// Zet in Render ENV: CORS_ORIGINS=https://kcdetailingstudio.nl,https://www.kcdetailingstudio.nl
+// CORS: zet in Render ENV bijv:
+// CORS_ORIGINS=https://kcdetailingstudio.nl,https://www.kcdetailingstudio.nl
 // Voor debug mag "*"
 const CORS_ORIGINS_RAW = process.env.CORS_ORIGINS || "*";
 const CORS_ORIGINS = CORS_ORIGINS_RAW
@@ -27,18 +28,14 @@ app.use(express.json({ limit: "1mb" }));
 
 /**
  * ✅ CORS FIX (Wix iframe / Safari friendly)
- * - Zorgt dat OPTIONS preflight altijd OK is
- * - Zorgt dat headers altijd terugkomen
+ * - OPTIONS preflight altijd OK
+ * - headers altijd mee terug
  */
 const corsOptions = {
   origin(origin, cb) {
-    // server-to-server / curl zonder Origin
-    if (!origin) return cb(null, true);
+    if (!origin) return cb(null, true); // server-to-server / curl
 
-    // allow all
     if (CORS_ORIGINS.includes("*")) return cb(null, true);
-
-    // exact match
     if (CORS_ORIGINS.includes(origin)) return cb(null, true);
 
     // wildcard support
@@ -57,8 +54,6 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-
-// ✅ Preflight altijd beantwoorden (heel belangrijk bij Wix)
 app.options("*", cors(corsOptions));
 
 // Static files (admin.html)
@@ -78,7 +73,7 @@ console.log("MAIL_TO =", process.env.MAIL_TO ? "set" : "missing");
 console.log("SMTP_HOST =", process.env.SMTP_HOST ? "set" : "missing");
 console.log("SMTP_USER =", process.env.SMTP_USER ? "set" : "missing");
 console.log("MAIL_FROM =", process.env.MAIL_FROM ? "set" : "missing");
-console.log("BRAND_NAME =", process.env.BRAND_NAME || "(default KC Detailing Studio)");
+console.log("LOGO_URL =", process.env.LOGO_URL ? "set" : "missing");
 console.log("=================");
 
 // ===== DATABASE =====
@@ -134,14 +129,13 @@ function getMailer() {
 
   if (!host || !port || !user || !pass) return null;
 
-  // App password kan met spaties geplakt worden — haal weg
   pass = String(pass).replace(/\s+/g, "");
 
   return nodemailer.createTransport({
     host,
     port,
-    secure: port === 465,      // 465 = SSL
-    requireTLS: port === 587,  // 587 = STARTTLS
+    secure: port === 465,
+    requireTLS: port === 587,
     auth: { user, pass },
   });
 }
@@ -192,7 +186,7 @@ app.get("/debug", (_, res) => {
     smtpConfigured: Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS),
     mailToSet: Boolean(process.env.MAIL_TO),
     mailFrom: process.env.MAIL_FROM || null,
-    brandName: process.env.BRAND_NAME || "KC Detailing Studio",
+    logoUrlSet: Boolean(process.env.LOGO_URL),
   });
 });
 
@@ -234,7 +228,7 @@ app.post("/api/leads", async (req, res) => {
   }
 });
 
-// Offerte via mail: opslaan + mailen + bevestiging klant
+// Offerte via mail: opslaan + mailen (jullie) + bevestiging klant
 async function handleEmailLead(req, res) {
   try {
     const { name, email, phone, service, message } = req.body || {};
@@ -248,19 +242,31 @@ async function handleEmailLead(req, res) {
 
     const id = await insertLead({ name, email, phone, service, message, source: "email" });
 
-    const ownerTo = process.env.MAIL_TO;
-    if (!ownerTo) return res.status(500).json({ ok: false, error: "MAIL_TO missing" });
-
     const transporter = getMailer();
     if (!transporter) return res.status(500).json({ ok: false, error: "SMTP config missing" });
 
+    // ===== BRAND/CONTACT (via ENV) =====
     const from = process.env.MAIL_FROM || process.env.SMTP_USER;
     const brand = process.env.BRAND_NAME || "KC Detailing Studio";
+    const logoUrl = process.env.LOGO_URL || "";
 
-    // 1) Mail naar jou
-    const ownerSubject = `KC Detailing – Offerte aanvraag: ${service}`;
+    const shopAddress = process.env.SHOP_ADDRESS || "Installatieweg 13, Huizen";
+    const shopPhone = process.env.SHOP_PHONE || "+31 6 2130 7621";
+    const shopEmail = process.env.SHOP_EMAIL || "kcdetailingstudio@gmail.com";
+    const shopWebsite = process.env.SHOP_WEBSITE || "https://kcdetailingstudio.nl";
+    const waNumber = process.env.WA_NUMBER || "31648367981";
+    const waLink = `https://wa.me/${waNumber}`;
+
+    // -----------------------
+    // 1) Mail naar jullie (owner)
+    // -----------------------
+    const ownerTo = process.env.MAIL_TO;
+    if (!ownerTo) return res.status(500).json({ ok: false, error: "MAIL_TO missing" });
+
+    const ownerSubject = `Nieuwe aanvraag #${id} – ${service}`;
+
     const ownerText =
-`Nieuwe offerte aanvraag (id: ${id})
+`Nieuwe offerte aanvraag (#${id})
 
 Naam: ${name}
 E-mail: ${email}
@@ -270,30 +276,111 @@ Service: ${service}
 
 Bericht:
 ${message}
+
+Pagina: ${req.body?.pageUrl || "-"}
+Datum: ${new Date().toLocaleString("nl-NL")}
 `;
-    await transporter.sendMail({ from, to: ownerTo, subject: ownerSubject, text: ownerText, replyTo: email });
 
-    // 2) Bevestiging naar klant
-    const confirmSubject = `Bevestiging offerteaanvraag – ${brand}`;
-    const confirmHtml = `
-      <div style="font-family:Arial,sans-serif;line-height:1.55;color:#111">
-        <h2 style="margin:0 0 12px">We hebben je aanvraag ontvangen</h2>
-        <p style="margin:0 0 10px">Bedankt ${escapeHtml(name)}. We nemen zo snel mogelijk contact met je op.</p>
+    const ownerHtml = `
+      <div style="font-family:Arial,sans-serif;line-height:1.55;color:#111;background:#f6f7fb;padding:18px">
+        <div style="max-width:720px;margin:0 auto;background:#fff;border:1px solid #e9e9ef;border-radius:14px;overflow:hidden">
+          <div style="padding:16px 18px;background:#0b0f1a;color:#fff">
+            <div style="display:flex;align-items:center;gap:12px">
+              ${logoUrl ? `<img src="${logoUrl}" alt="${escapeHtml(brand)}" style="height:34px;max-width:180px;object-fit:contain;background:#fff;border-radius:8px;padding:6px">` : ""}
+              <div>
+                <div style="font-size:12px;opacity:.85;margin:0 0 4px">Nieuwe aanvraag</div>
+                <div style="font-size:20px;font-weight:800;margin:0">Aanvraag #${id} – ${escapeHtml(service)}</div>
+              </div>
+            </div>
+          </div>
 
-        <div style="border:1px solid #eee;border-radius:10px;padding:14px;margin:14px 0">
-          <h3 style="margin:0 0 10px;font-size:16px">Samenvatting</h3>
-          <table style="border-collapse:collapse;width:100%;font-size:14px">
-            <tr><td style="padding:6px 0;width:160px"><b>Referentie</b></td><td style="padding:6px 0">#${id}</td></tr>
-            <tr><td style="padding:6px 0"><b>Dienst</b></td><td style="padding:6px 0">${escapeHtml(service)}</td></tr>
-            ${phone ? `<tr><td style="padding:6px 0"><b>Telefoon</b></td><td style="padding:6px 0">${escapeHtml(phone)}</td></tr>` : ""}
-          </table>
-          <p style="margin:10px 0 0"><b>Bericht:</b><br/>${escapeHtml(message).replaceAll("\n","<br/>")}</p>
+          <div style="padding:16px 18px">
+            <table style="border-collapse:collapse;width:100%;font-size:14px">
+              <tr><td style="padding:8px 0;width:160px"><b>Naam</b></td><td style="padding:8px 0">${escapeHtml(name)}</td></tr>
+              <tr><td style="padding:8px 0"><b>E-mail</b></td><td style="padding:8px 0"><a href="mailto:${escapeHtml(email)}" style="color:#111">${escapeHtml(email)}</a></td></tr>
+              <tr><td style="padding:8px 0"><b>Telefoon</b></td><td style="padding:8px 0">${escapeHtml(phone || "-")}</td></tr>
+              <tr><td style="padding:8px 0"><b>Dienst</b></td><td style="padding:8px 0">${escapeHtml(service)}</td></tr>
+              <tr><td style="padding:8px 0"><b>Pagina</b></td><td style="padding:8px 0">${escapeHtml(req.body?.pageUrl || "-")}</td></tr>
+            </table>
+
+            <div style="margin-top:14px;padding:12px 12px;border:1px solid #eee;border-radius:12px;background:#fafafa">
+              <div style="font-weight:800;margin:0 0 6px">Bericht</div>
+              <div>${escapeHtml(message).replaceAll("\n","<br/>")}</div>
+            </div>
+
+            <div style="margin-top:14px;font-size:12px;color:#555">
+              Referentie: <b>#${id}</b> • ${new Date().toLocaleString("nl-NL")}
+            </div>
+          </div>
         </div>
+      </div>
+    `;
 
-        <p style="margin:0">
-          Met vriendelijke groet,<br/>
-          <b>${escapeHtml(brand)}</b>
-        </p>
+    await transporter.sendMail({
+      from,
+      to: ownerTo,
+      subject: ownerSubject,
+      text: ownerText,
+      html: ownerHtml,
+      replyTo: email, // replies gaan direct naar klant
+    });
+
+    // -----------------------
+    // 2) Bevestiging naar klant
+    // -----------------------
+    const confirmSubject = `Bevestiging aanvraag #${id} – ${brand}`;
+
+    const confirmHtml = `
+      <div style="font-family:Arial,sans-serif;line-height:1.55;color:#111;background:#f6f7fb;padding:18px">
+        <div style="max-width:720px;margin:0 auto;background:#fff;border:1px solid #e9e9ef;border-radius:14px;overflow:hidden">
+
+          <div style="padding:18px 18px;background:#0b0f1a;color:#fff">
+            <div style="display:flex;align-items:center;gap:12px">
+              ${logoUrl ? `<img src="${logoUrl}" alt="${escapeHtml(brand)}" style="height:34px;max-width:180px;object-fit:contain;background:#fff;border-radius:8px;padding:6px">` : ""}
+              <div>
+                <div style="font-size:18px;font-weight:800;margin:0">${escapeHtml(brand)}</div>
+                <div style="font-size:13px;opacity:.85;margin-top:2px">We hebben je aanvraag ontvangen</div>
+              </div>
+            </div>
+          </div>
+
+          <div style="padding:16px 18px">
+            <p style="margin:0 0 10px">Hoi ${escapeHtml(name)},</p>
+            <p style="margin:0 0 12px">
+              Bedankt voor je aanvraag. We nemen zo snel mogelijk contact met je op met een voorstel op maat.
+            </p>
+
+            <div style="border:1px solid #eee;border-radius:12px;padding:14px;background:#fafafa;margin:12px 0">
+              <div style="font-weight:800;margin:0 0 8px">Samenvatting</div>
+              <table style="border-collapse:collapse;width:100%;font-size:14px">
+                <tr><td style="padding:6px 0;width:160px"><b>Aanvraagnummer</b></td><td style="padding:6px 0">#${id}</td></tr>
+                <tr><td style="padding:6px 0"><b>Dienst</b></td><td style="padding:6px 0">${escapeHtml(service)}</td></tr>
+                ${phone ? `<tr><td style="padding:6px 0"><b>Telefoon</b></td><td style="padding:6px 0">${escapeHtml(phone)}</td></tr>` : ""}
+                <tr><td style="padding:6px 0"><b>E-mail</b></td><td style="padding:6px 0">${escapeHtml(email)}</td></tr>
+              </table>
+
+              <div style="margin-top:10px">
+                <div style="font-weight:800;margin:0 0 6px">Jouw bericht</div>
+                <div>${escapeHtml(message).replaceAll("\n","<br/>")}</div>
+              </div>
+            </div>
+
+            <div style="display:flex;gap:10px;flex-wrap:wrap;margin:14px 0 6px">
+              <a href="${waLink}" style="display:inline-block;background:#25D366;color:#0b0f1a;text-decoration:none;font-weight:800;padding:10px 14px;border-radius:10px">WhatsApp</a>
+              <a href="${shopWebsite}" style="display:inline-block;background:#111827;color:#fff;text-decoration:none;font-weight:800;padding:10px 14px;border-radius:10px">Website</a>
+            </div>
+
+            <div style="font-size:12px;color:#555;margin-top:10px">
+              <b>Contact</b><br/>
+              ${escapeHtml(shopAddress)}<br/>
+              Tel: ${escapeHtml(shopPhone)} • E-mail: ${escapeHtml(shopEmail)}
+            </div>
+
+            <div style="margin-top:14px;border-top:1px solid #eee;padding-top:12px;font-size:11px;color:#6b7280">
+              Tip: Bewaar je aanvraagnummer <b>#${id}</b> voor snelle communicatie.
+            </div>
+          </div>
+        </div>
       </div>
     `;
 
@@ -313,9 +400,7 @@ ${message}
 }
 
 app.post("/api/leads/email", handleEmailLead);
-
-// ✅ compat route
-app.post("/api/email", handleEmailLead);
+app.post("/api/email", handleEmailLead); // compat
 
 // Admin API
 app.get("/api/admin/leads", requireAdmin, (req, res) => {
